@@ -532,7 +532,6 @@ function Export-ToHTML {
 <head>
     <meta charset="UTF-8">
     <title>Azure VM Oversized Report</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -543,43 +542,7 @@ function Export-ToHTML {
             color: #0078d4;
             border-bottom: 3px solid #0078d4;
             padding-bottom: 10px;
-        }
-        h2 {
-            color: #005a9e;
-            margin-top: 30px;
-        }
-        .summary {
-            background-color: #fff;
-            padding: 20px;
-            border-radius: 5px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
             margin-bottom: 20px;
-        }
-        .stat-box {
-            display: inline-block;
-            background-color: #ff8c00;
-            color: white;
-            padding: 15px 25px;
-            margin: 10px;
-            border-radius: 5px;
-            min-width: 150px;
-            text-align: center;
-        }
-        .stat-number {
-            font-size: 32px;
-            font-weight: bold;
-        }
-        .stat-label {
-            font-size: 14px;
-            margin-top: 5px;
-        }
-        .chart-container {
-            background-color: #fff;
-            padding: 20px;
-            border-radius: 5px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            margin-bottom: 20px;
-            max-height: 500px;
         }
         table {
             width: 100%;
@@ -608,32 +571,19 @@ function Export-ToHTML {
             background-color: #fff3e0 !important;
         }
         .footer {
-            margin-top: 30px;
-            padding: 20px;
+            margin-top: 20px;
+            padding: 15px;
             background-color: #fff;
             border-radius: 5px;
             text-align: center;
             color: #605e5c;
+            font-size: 12px;
         }
     </style>
 </head>
 <body>
-    <h1>Azure VM Oversized Report</h1>
+    <h1>Azure VM Oversized Report - $totalVMs VMs</h1>
 
-    <div class="summary">
-        <h2>Executive Summary</h2>
-        <div class="stat-box">
-            <div class="stat-number">$totalVMs</div>
-            <div class="stat-label">Oversized VMs</div>
-        </div>
-    </div>
-
-    <div class="chart-container">
-        <h2>Time Above Threshold Analysis</h2>
-        <canvas id="thresholdChart"></canvas>
-    </div>
-
-    <h2>Oversized VMs Details</h2>
     <table>
         <thead>
             <tr>
@@ -701,64 +651,6 @@ function Export-ToHTML {
         <p>Report generated on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
         <p>Analysis period: $DaysToAnalyze days | Thresholds: CPU < $CPUOversizedThreshold%, RAM < $RAMOversizedThreshold%</p>
     </div>
-
-    <script>
-        const ctx = document.getElementById('thresholdChart').getContext('2d');
-        const chart = new Chart(ctx, {
-            type: 'bar',
-            data: {
-                labels: ['0-10%', '10-20%', '20-30%', '30-50%', '50%+'],
-                datasets: [{
-                    label: 'CPU Time Above 80%',
-                    data: [$($cpuRanges["0-10%"]), $($cpuRanges["10-20%"]), $($cpuRanges["20-30%"]), $($cpuRanges["30-50%"]), $($cpuRanges["50%+"])],
-                    backgroundColor: 'rgba(255, 99, 132, 0.7)',
-                    borderColor: 'rgba(255, 99, 132, 1)',
-                    borderWidth: 1
-                }, {
-                    label: 'Memory Time Above 85%',
-                    data: [$($memoryRanges["0-10%"]), $($memoryRanges["10-20%"]), $($memoryRanges["20-30%"]), $($memoryRanges["30-50%"]), $($memoryRanges["50%+"])],
-                    backgroundColor: 'rgba(54, 162, 235, 0.7)',
-                    borderColor: 'rgba(54, 162, 235, 1)',
-                    borderWidth: 1
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: true,
-                scales: {
-                    y: {
-                        beginAtZero: true,
-                        ticks: {
-                            stepSize: 1
-                        },
-                        title: {
-                            display: true,
-                            text: 'Number of VMs'
-                        }
-                    },
-                    x: {
-                        title: {
-                            display: true,
-                            text: 'Time Above Threshold Range'
-                        }
-                    }
-                },
-                plugins: {
-                    legend: {
-                        display: true,
-                        position: 'top'
-                    },
-                    tooltip: {
-                        callbacks: {
-                            label: function(context) {
-                                return context.dataset.label + ': ' + context.parsed.y + ' VMs';
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    </script>
 </body>
 </html>
 "@
