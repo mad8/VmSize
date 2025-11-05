@@ -490,22 +490,17 @@ function Export-ToHTML {
 
         # Statistiques globales
         $totalVMs = $Data.Count
-        $avgCPU = if ($Data.Count -gt 0) {
-            [math]::Round(($Data | Measure-Object -Property AvgCPUPercent -Average).Average, 2)
-        } else {
-            0
-        }
 
-        # Calculer la moyenne de RAM usage (exclure les valeurs nulles)
-        $avgMemory = if ($Data.Count -gt 0) {
-            $memoryData = $Data | Where-Object { $null -ne $_.AvgMemoryUsagePercent }
-            if ($memoryData.Count -gt 0) {
-                [math]::Round(($memoryData | Measure-Object -Property AvgMemoryUsagePercent -Average).Average, 2)
-            } else {
-                "N/A"
-            }
-        } else {
-            "N/A"
+        # Préparer les données pour le graphique
+        $chartLabels = @()
+        $chartCPUData = @()
+        $chartMemoryData = @()
+
+        foreach ($item in $Data) {
+            $chartLabels += "'$($item.VMName)'"
+            $chartCPUData += $item.CPUPercentageAboveThreshold
+            $memPercent = if ($null -ne $item.MemoryPercentageAboveThreshold) { $item.MemoryPercentageAboveThreshold } else { 0 }
+            $chartMemoryData += $memPercent
         }
 
         $html = @"
@@ -514,6 +509,7 @@ function Export-ToHTML {
 <head>
     <meta charset="UTF-8">
     <title>Azure VM Oversized Report</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -554,6 +550,14 @@ function Export-ToHTML {
             font-size: 14px;
             margin-top: 5px;
         }
+        .chart-container {
+            background-color: #fff;
+            padding: 20px;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            max-height: 500px;
+        }
         table {
             width: 100%;
             border-collapse: collapse;
@@ -593,14 +597,11 @@ function Export-ToHTML {
             <div class="stat-number">$totalVMs</div>
             <div class="stat-label">Oversized VMs</div>
         </div>
-        <div class="stat-box">
-            <div class="stat-number">$avgCPU%</div>
-            <div class="stat-label">Average CPU Usage</div>
-        </div>
-        <div class="stat-box">
-            <div class="stat-number">$avgMemory$(if ($avgMemory -ne 'N/A') { '%' })</div>
-            <div class="stat-label">Average Memory Usage</div>
-        </div>
+    </div>
+
+    <div class="chart-container">
+        <h2>Time Above Threshold Analysis</h2>
+        <canvas id="thresholdChart"></canvas>
     </div>
 
     <h2>Oversized VMs Details</h2>
@@ -662,6 +663,62 @@ function Export-ToHTML {
         <p>Report generated on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
         <p>Analysis period: $DaysToAnalyze days | Thresholds: CPU < $CPUOversizedThreshold%, RAM < $RAMOversizedThreshold%</p>
     </div>
+
+    <script>
+        const ctx = document.getElementById('thresholdChart').getContext('2d');
+        const chart = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: [$($chartLabels -join ', ')],
+                datasets: [{
+                    label: 'CPU Time Above 80% (%)',
+                    data: [$($chartCPUData -join ', ')],
+                    backgroundColor: 'rgba(255, 99, 132, 0.7)',
+                    borderColor: 'rgba(255, 99, 132, 1)',
+                    borderWidth: 1
+                }, {
+                    label: 'Memory Time Above 85% (%)',
+                    data: [$($chartMemoryData -join ', ')],
+                    backgroundColor: 'rgba(54, 162, 235, 0.7)',
+                    borderColor: 'rgba(54, 162, 235, 1)',
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: true,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        max: 100,
+                        title: {
+                            display: true,
+                            text: 'Percentage of Time (%)'
+                        }
+                    },
+                    x: {
+                        title: {
+                            display: true,
+                            text: 'VM Name'
+                        }
+                    }
+                },
+                plugins: {
+                    legend: {
+                        display: true,
+                        position: 'top'
+                    },
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                return context.dataset.label + ': ' + context.parsed.y.toFixed(1) + '%';
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    </script>
 </body>
 </html>
 "@
