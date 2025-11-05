@@ -1,8 +1,537 @@
+<#
+.SYNOPSIS
+    Script pour analyser l'utilisation des ressources Azure VM (CPU et RAM) vs le sizing configuré.
+
+.DESCRIPTION
+    Ce script récupère les métriques d'utilisation des VMs Azure et les compare au sizing
+    pour identifier les VMs oversized ou undersized.
+
+.PARAMETER SubscriptionIds
+    Liste des IDs de souscriptions Azure à analyser (séparés par des virgules).
+
+.PARAMETER ResourceGroupName
+    Nom d'un Resource Group spécifique à analyser (optionnel).
+
+.PARAMETER DaysToAnalyze
+    Nombre de jours d'historique à analyser (par défaut: 30 jours).
+
+.PARAMETER OutputPath
+    Chemin du fichier de sortie pour le rapport (par défaut: rapport dans le répertoire courant).
+
+.PARAMETER ExportFormat
+    Format d'export: CSV, HTML, ou Both (par défaut: Both).
+
+.EXAMPLE
+    .\Get-AzureVMSizingReport.ps1 -SubscriptionIds "sub-id-1,sub-id-2" -DaysToAnalyze 30
+
+.EXAMPLE
+    .\Get-AzureVMSizingReport.ps1 -SubscriptionIds "sub-id-1" -ResourceGroupName "RG-PROD" -ExportFormat HTML
+
+.NOTES
+    Version: 1.0
+    Auteur: Script généré pour l'analyse de sizing Azure VM
+    Prérequis: Module Az.Accounts, Az.Compute, Az.Monitor
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $false)]
+    [string]$SubscriptionIds,
+
+    [Parameter(Mandatory = $false)]
+    [string]$ResourceGroupName,
+
+    [Parameter(Mandatory = $false)]
+    [int]$DaysToAnalyze = 30,
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutputPath = ".\AzureVMSizingReport",
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("CSV", "HTML", "Both")]
+    [string]$ExportFormat = "Both",
+
+    [Parameter(Mandatory = $false)]
+    [int]$CPUOversizedThreshold = 20,
+
+    [Parameter(Mandatory = $false)]
+    [int]$RAMOversizedThreshold = 30
+)
+
+#Requires -Modules Az.Accounts, Az.Compute, Az.Monitor
+
+# Fonction pour écrire des messages colorés
+function Write-ColorOutput {
+    param(
+        [string]$Message,
+        [string]$Type = "Info"
+    )
+
+    switch ($Type) {
+        "Success" { Write-Host $Message -ForegroundColor Green }
+        "Warning" { Write-Host $Message -ForegroundColor Yellow }
+        "Error" { Write-Host $Message -ForegroundColor Red }
+        "Info" { Write-Host $Message -ForegroundColor Cyan }
+        default { Write-Host $Message }
+    }
+}
+
+# Fonction pour vérifier et installer les modules requis
+function Test-AzModules {
+    Write-ColorOutput "Vérification des modules Azure PowerShell..." "Info"
+
+    $requiredModules = @("Az.Accounts", "Az.Compute", "Az.Monitor")
+    $missingModules = @()
+
+    foreach ($module in $requiredModules) {
+        if (-not (Get-Module -ListAvailable -Name $module)) {
+            $missingModules += $module
+        }
+    }
+
+    if ($missingModules.Count -gt 0) {
+        Write-ColorOutput "Modules manquants: $($missingModules -join ', ')" "Warning"
+        Write-ColorOutput "Installez-les avec: Install-Module -Name Az -AllowClobber -Scope CurrentUser" "Warning"
+        return $false
+    }
+
+    Write-ColorOutput "Tous les modules requis sont installés." "Success"
+    return $true
+}
+
+# Fonction pour se connecter à Azure
+function Connect-AzureAccount {
+    Write-ColorOutput "Connexion à Azure..." "Info"
+
+    try {
+        # Vérifier si déjà connecté
+        $context = Get-AzContext -ErrorAction SilentlyContinue
+
+        if ($null -eq $context) {
+            Write-ColorOutput "Aucune session Azure active. Ouverture de la fenêtre d'authentification..." "Warning"
+            Connect-AzAccount -ErrorAction Stop | Out-Null
+            $context = Get-AzContext
+        }
+
+        Write-ColorOutput "Connecté en tant que: $($context.Account.Id)" "Success"
+        return $true
+    }
+    catch {
+        Write-ColorOutput "Erreur lors de la connexion à Azure: $_" "Error"
+        return $false
+    }
+}
+
+# Fonction pour obtenir les métriques CPU avec analyse des pics soutenus
+function Get-VMCPUMetrics {
+    param(
+        [string]$ResourceId,
+        [datetime]$StartTime,
+        [datetime]$EndTime,
+        [int]$HighCPUThreshold = 80
+    )
+
+    try {
+        $metrics = Get-AzMetric -ResourceId $ResourceId `
+            -MetricName "Percentage CPU" `
+            -StartTime $StartTime `
+            -EndTime $EndTime `
+            -TimeGrain 00:05:00 `
+            -AggregationType Average `
+            -ErrorAction Stop
+
+        if ($metrics.Data.Count -gt 0) {
+            $avgCPU = ($metrics.Data | Measure-Object -Property Average -Average).Average
+
+            # Analyser les pics (CPU > seuil)
+            $highCPUPeriods = @()
+            $currentPeriodDuration = 0
+            $totalPeakOccurrences = 0  # Nombre total de points au-dessus du seuil
+
+            foreach ($dataPoint in $metrics.Data) {
+                if ($dataPoint.Average -ge $HighCPUThreshold) {
+                    $currentPeriodDuration++
+                    $totalPeakOccurrences++
+                } else {
+                    if ($currentPeriodDuration -gt 0) {
+                        # Convertir en minutes (chaque point = 5 minutes)
+                        $highCPUPeriods += $currentPeriodDuration * 5
+                        $currentPeriodDuration = 0
+                    }
+                }
+            }
+            # Ajouter la dernière période si elle existe
+            if ($currentPeriodDuration -gt 0) {
+                $highCPUPeriods += $currentPeriodDuration * 5
+            }
+
+            # Calculer la durée moyenne des pics en minutes
+            $avgPeakDurationMinutes = if ($highCPUPeriods.Count -gt 0) {
+                [math]::Round(($highCPUPeriods | Measure-Object -Average).Average, 1)
+            } else {
+                0
+            }
+
+            # Nombre de pics distincts
+            $peakCount = $highCPUPeriods.Count
+
+            # Calculer le pourcentage de temps passé au-dessus du seuil
+            $percentageAboveThreshold = if ($metrics.Data.Count -gt 0) {
+                [math]::Round(($totalPeakOccurrences / $metrics.Data.Count) * 100, 1)
+            } else {
+                0
+            }
+
+            return @{
+                Average = [math]::Round($avgCPU, 2)
+                PeakCount = $peakCount
+                AvgPeakDurationMinutes = $avgPeakDurationMinutes
+                PercentageAboveThreshold = $percentageAboveThreshold
+            }
+        }
+    }
+    catch {
+        Write-ColorOutput "Erreur lors de la récupération des métriques CPU pour $ResourceId : $_" "Warning"
+    }
+
+    return @{
+        Average = 0
+        PeakCount = 0
+        AvgPeakDurationMinutes = 0
+        PercentageAboveThreshold = 0
+    }
+}
+
+# Fonction pour obtenir les métriques RAM avec analyse des pics soutenus
+function Get-VMMemoryMetrics {
+    param(
+        [string]$ResourceId,
+        [datetime]$StartTime,
+        [datetime]$EndTime,
+        [int]$HighMemoryUsageThreshold = 85
+    )
+
+    try {
+        $metrics = Get-AzMetric -ResourceId $ResourceId `
+            -MetricName "Available Memory Bytes" `
+            -StartTime $StartTime `
+            -EndTime $EndTime `
+            -TimeGrain 00:05:00 `
+            -AggregationType Average `
+            -ErrorAction Stop
+
+        if ($metrics.Data.Count -gt 0) {
+            $avgAvailableMemoryBytes = ($metrics.Data | Measure-Object -Property Average -Average).Average
+            $minAvailableMemoryBytes = ($metrics.Data | Measure-Object -Property Average -Minimum).Minimum
+
+            return @{
+                AverageAvailableGB = [math]::Round($avgAvailableMemoryBytes / 1GB, 2)
+                MinAvailableGB = [math]::Round($minAvailableMemoryBytes / 1GB, 2)
+                RawData = $metrics.Data
+            }
+        }
+    }
+    catch {
+        # La métrique "Available Memory Bytes" nécessite l'agent de diagnostic
+        # Si non disponible, on retourne des valeurs nulles
+        return @{
+            AverageAvailableGB = $null
+            MinAvailableGB = $null
+            RawData = $null
+        }
+    }
+
+    return @{
+        AverageAvailableGB = $null
+        MinAvailableGB = $null
+        RawData = $null
+    }
+}
+
+# Fonction pour analyser les pics soutenus de mémoire
+function Get-MemoryPeakAnalysis {
+    param(
+        [array]$RawData,
+        [double]$TotalMemoryGB,
+        [int]$HighMemoryUsageThreshold = 85
+    )
+
+    if ($null -eq $RawData -or $RawData.Count -eq 0 -or $TotalMemoryGB -le 0) {
+        return @{
+            PeakCount = 0
+            AvgPeakDurationMinutes = 0
+            PercentageAboveThreshold = 0
+        }
+    }
+
+    $highMemoryPeriods = @()
+    $currentPeriodDuration = 0
+    $totalPeakOccurrences = 0  # Nombre total de points au-dessus du seuil
+
+    foreach ($dataPoint in $RawData) {
+        $availableGB = [math]::Round($dataPoint.Average / 1GB, 2)
+        $usedPercent = (($TotalMemoryGB - $availableGB) / $TotalMemoryGB) * 100
+
+        if ($usedPercent -ge $HighMemoryUsageThreshold) {
+            $currentPeriodDuration++
+            $totalPeakOccurrences++
+        } else {
+            if ($currentPeriodDuration -gt 0) {
+                # Convertir en minutes (chaque point = 5 minutes)
+                $highMemoryPeriods += $currentPeriodDuration * 5
+                $currentPeriodDuration = 0
+            }
+        }
+    }
+    # Ajouter la dernière période si elle existe
+    if ($currentPeriodDuration -gt 0) {
+        $highMemoryPeriods += $currentPeriodDuration * 5
+    }
+
+    # Calculer la durée moyenne des pics en minutes
+    $avgPeakDurationMinutes = if ($highMemoryPeriods.Count -gt 0) {
+        [math]::Round(($highMemoryPeriods | Measure-Object -Average).Average, 1)
+    } else {
+        0
+    }
+
+    # Calculer le pourcentage de temps passé au-dessus du seuil
+    $percentageAboveThreshold = if ($RawData.Count -gt 0) {
+        [math]::Round(($totalPeakOccurrences / $RawData.Count) * 100, 1)
+    } else {
+        0
+    }
+
+    return @{
+        PeakCount = $highMemoryPeriods.Count
+        AvgPeakDurationMinutes = $avgPeakDurationMinutes
+        PercentageAboveThreshold = $percentageAboveThreshold
+    }
+}
+
+# Fonction pour obtenir les informations de sizing d'une VM depuis Azure
+function Get-VMSizeInfo {
+    param(
+        [string]$VMSize,
+        [string]$Location
+    )
+
+    try {
+        # Récupérer les informations réelles depuis Azure
+        $vmSizes = Get-AzVMSize -Location $Location -ErrorAction Stop
+        $sizeInfo = $vmSizes | Where-Object { $_.Name -eq $VMSize }
+
+        if ($sizeInfo) {
+            return @{
+                Cores = $sizeInfo.NumberOfCores
+                MemoryGB = [math]::Round($sizeInfo.MemoryInMB / 1024, 0)
+            }
+        }
+    }
+    catch {
+        Write-ColorOutput "Erreur lors de la récupération des infos de sizing pour $VMSize : $_" "Warning"
+    }
+
+    # Valeurs par défaut si le type n'est pas trouvé
+    return @{Cores = 0; MemoryGB = 0}
+}
+
+# Fonction principale pour analyser les VMs
+function Get-VMAnalysis {
+    $startTime = (Get-Date).AddDays(-$DaysToAnalyze)
+    $endTime = Get-Date
+
+    Write-ColorOutput "`nPériode d'analyse: du $($startTime.ToString('yyyy-MM-dd')) au $($endTime.ToString('yyyy-MM-dd'))" "Info"
+    Write-ColorOutput "Seuils d'oversizing: CPU < $CPUOversizedThreshold%, RAM < $RAMOversizedThreshold%`n" "Info"
+
+    $allResults = @()
+    $subscriptions = @()
+
+    # Déterminer les souscriptions à analyser
+    if ($SubscriptionIds) {
+        $subIds = $SubscriptionIds -split ','
+        foreach ($subId in $subIds) {
+            $sub = Get-AzSubscription -SubscriptionId $subId.Trim() -ErrorAction SilentlyContinue
+            if ($sub) {
+                $subscriptions += $sub
+            }
+            else {
+                Write-ColorOutput "Souscription non trouvée: $subId" "Warning"
+            }
+        }
+    }
+    else {
+        # Si aucune souscription spécifiée, utiliser toutes les souscriptions accessibles
+        $subscriptions = Get-AzSubscription
+    }
+
+    if ($subscriptions.Count -eq 0) {
+        Write-ColorOutput "Aucune souscription à analyser." "Error"
+        return $allResults
+    }
+
+    Write-ColorOutput "Nombre de souscriptions à analyser: $($subscriptions.Count)" "Info"
+
+    foreach ($subscription in $subscriptions) {
+        Write-ColorOutput "`n=== Analyse de la souscription: $($subscription.Name) ===" "Info"
+        Set-AzContext -SubscriptionId $subscription.Id | Out-Null
+
+        # Récupérer les VMs
+        $vms = @()
+        if ($ResourceGroupName) {
+            Write-ColorOutput "Récupération des VMs du Resource Group: $ResourceGroupName" "Info"
+            $vms = Get-AzVM -ResourceGroupName $ResourceGroupName -Status -ErrorAction SilentlyContinue
+        }
+        else {
+            Write-ColorOutput "Récupération de toutes les VMs de la souscription..." "Info"
+            $vms = Get-AzVM -Status
+        }
+
+        Write-ColorOutput "Nombre de VMs trouvées: $($vms.Count)" "Info"
+
+        $vmCounter = 0
+        foreach ($vm in $vms) {
+            $vmCounter++
+            Write-ColorOutput "[$vmCounter/$($vms.Count)] Analyse de la VM: $($vm.Name)" "Info"
+
+            # Obtenir le statut de la VM
+            $powerState = ($vm.PowerState -split ' ')[1]
+
+            # Récupérer les métriques historiques depuis Azure Monitor (indépendamment de l'état actuel)
+            # Azure Monitor conserve l'historique même pour les VMs arrêtées
+            $cpuMetrics = Get-VMCPUMetrics -ResourceId $vm.Id -StartTime $startTime -EndTime $endTime
+            $memMetrics = Get-VMMemoryMetrics -ResourceId $vm.Id -StartTime $startTime -EndTime $endTime
+
+            # Obtenir les informations de sizing réelles depuis Azure
+            $vmSize = Get-VMSizeInfo -VMSize $vm.HardwareProfile.VmSize -Location $vm.Location
+
+            # Calculer l'utilisation mémoire en pourcentage
+            $memoryUsagePercent = $null
+            if ($null -ne $memMetrics.AverageAvailableGB -and $vmSize.MemoryGB -gt 0) {
+                $avgUsedMemory = $vmSize.MemoryGB - $memMetrics.AverageAvailableGB
+                $memoryUsagePercent = [math]::Round(($avgUsedMemory / $vmSize.MemoryGB) * 100, 2)
+            }
+
+            # Analyser les pics soutenus de mémoire
+            $memoryPeakAnalysis = Get-MemoryPeakAnalysis -RawData $memMetrics.RawData -TotalMemoryGB $vmSize.MemoryGB
+
+            # Déterminer le statut de sizing basé sur les métriques historiques
+            $sizingStatus = "OK"
+
+            # Analyser uniquement si on a des données de métriques (Average > 0 signifie qu'il y a eu de l'activité)
+            if ($cpuMetrics.Average -gt 0 -or ($null -ne $memoryUsagePercent -and $memoryUsagePercent -gt 0)) {
+                # Analyser le CPU et RAM moyens pour déterminer si oversized
+                if ($cpuMetrics.Average -lt $CPUOversizedThreshold -and
+                    ($null -eq $memoryUsagePercent -or $memoryUsagePercent -lt $RAMOversizedThreshold)) {
+                    $sizingStatus = "OVERSIZED"
+                }
+                elseif ($cpuMetrics.Average -lt $CPUOversizedThreshold) {
+                    $sizingStatus = "CPU_OVERSIZED"
+                }
+                elseif ($null -ne $memoryUsagePercent -and $memoryUsagePercent -lt $RAMOversizedThreshold) {
+                    $sizingStatus = "RAM_OVERSIZED"
+                }
+            }
+
+            # Filtrer uniquement les VMs oversized (basé sur l'historique Azure Monitor)
+            $isOversized = $sizingStatus -like "*OVERSIZED*"
+
+            if ($isOversized) {
+                $result = [PSCustomObject]@{
+                    Subscription = $subscription.Name
+                    SubscriptionId = $subscription.Id
+                    ResourceGroup = $vm.ResourceGroupName
+                    VMName = $vm.Name
+                    Location = $vm.Location
+                    VMSize = $vm.HardwareProfile.VmSize
+                    Cores = $vmSize.Cores
+                    MemoryGB = $vmSize.MemoryGB
+                    PowerState = $powerState
+                    AvgCPUPercent = $cpuMetrics.Average
+                    CPUPeakCount = $cpuMetrics.PeakCount
+                    CPUAvgPeakDurationMinutes = $cpuMetrics.AvgPeakDurationMinutes
+                    CPUPercentageAboveThreshold = $cpuMetrics.PercentageAboveThreshold
+                    AvgMemoryUsagePercent = $memoryUsagePercent
+                    MemoryPeakCount = $memoryPeakAnalysis.PeakCount
+                    MemoryAvgPeakDurationMinutes = $memoryPeakAnalysis.AvgPeakDurationMinutes
+                    MemoryPercentageAboveThreshold = $memoryPeakAnalysis.PercentageAboveThreshold
+                    AvailableMemoryGB = $memMetrics.AverageAvailableGB
+                    AnalysisPeriodDays = $DaysToAnalyze
+                }
+
+                $allResults += $result
+            }
+        }
+    }
+
+    return $allResults
+}
+
+# Fonction pour exporter en CSV
+function Export-ToCSV {
+    param([array]$Data, [string]$Path)
+
+    try {
+        $csvPath = "$Path.csv"
+        $Data | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+        Write-ColorOutput "CSV report generated: $csvPath" "Success"
+    }
+    catch {
+        Write-ColorOutput "Error generating CSV: $_" "Error"
+    }
+}
+
+# Fonction pour exporter en HTML
+function Export-ToHTML {
+    param([array]$Data, [string]$Path)
+
+    try {
+        $htmlPath = "$Path.html"
+
+        # Statistiques globales
+        $totalVMs = $Data.Count
+
+        # Préparer les données pour le graphique - compter les VMs par tranche de pourcentage
+        $cpuRanges = @{
+            "0-10%" = 0
+            "10-20%" = 0
+            "20-30%" = 0
+            "30-50%" = 0
+            "50%+" = 0
+        }
+
+        $memoryRanges = @{
+            "0-10%" = 0
+            "10-20%" = 0
+            "20-30%" = 0
+            "30-50%" = 0
+            "50%+" = 0
+        }
+
+        foreach ($item in $Data) {
+            # CPU
+            $cpuPercent = $item.CPUPercentageAboveThreshold
+            if ($cpuPercent -lt 10) { $cpuRanges["0-10%"]++ }
+            elseif ($cpuPercent -lt 20) { $cpuRanges["10-20%"]++ }
+            elseif ($cpuPercent -lt 30) { $cpuRanges["20-30%"]++ }
+            elseif ($cpuPercent -lt 50) { $cpuRanges["30-50%"]++ }
+            else { $cpuRanges["50%+"]++ }
+
+            # Memory
+            $memPercent = if ($null -ne $item.MemoryPercentageAboveThreshold) { $item.MemoryPercentageAboveThreshold } else { 0 }
+            if ($memPercent -lt 10) { $memoryRanges["0-10%"]++ }
+            elseif ($memPercent -lt 20) { $memoryRanges["10-20%"]++ }
+            elseif ($memPercent -lt 30) { $memoryRanges["20-30%"]++ }
+            elseif ($memPercent -lt 50) { $memoryRanges["30-50%"]++ }
+            else { $memoryRanges["50%+"]++ }
+        }
+
+        $html = @"
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Azure VM Oversized Report - TEST</title>
+    <title>Azure VM Oversized Report</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         body {
@@ -89,12 +618,12 @@
     </style>
 </head>
 <body>
-    <h1>Azure VM Oversized Report - TEST DATA</h1>
+    <h1>Azure VM Oversized Report</h1>
 
     <div class="summary">
         <h2>Executive Summary</h2>
         <div class="stat-box">
-            <div class="stat-number">3</div>
+            <div class="stat-number">$totalVMs</div>
             <div class="stat-label">Oversized VMs</div>
         </div>
     </div>
@@ -125,60 +654,52 @@
                 <th>Time Above 85% (%)</th>
             </tr>
         </thead>
-        <tbody>            <tr class="">
-                <td>Test-Subscription-1</td>
-                <td>RG-TEST-PROD</td>
-                <td>vm-test-web-01</td>
-                <td>eastus</td>
-                <td>Standard_D4s_v3</td>
-                <td>4</td>
-                <td>16</td>
-                <td>12.5</td>
-                <td>3</td>
-                <td>15.5</td>
-                <td>8.3</td>
-                <td>18.7</td>
-                <td>2</td>
-                <td>10</td>
-                <td>5.2</td>
-            </tr>            <tr class="">
-                <td>Test-Subscription-1</td>
-                <td>RG-TEST-DEV</td>
-                <td>vm-test-app-02</td>
-                <td>westeurope</td>
-                <td>Standard_D8s_v3</td>
-                <td>8</td>
-                <td>32</td>
-                <td>8.2</td>
-                <td>0</td>
-                <td>0</td>
-                <td>0</td>
-                <td>22.3</td>
-                <td>1</td>
-                <td>25</td>
-                <td>12.1</td>
-            </tr>            <tr class="warning-medium">
-                <td>Test-Subscription-2</td>
-                <td>RG-DEMO</td>
-                <td>vm-demo-db-01</td>
-                <td>northeurope</td>
-                <td>Standard_E4s_v3</td>
-                <td>4</td>
-                <td>32</td>
-                <td>15.8</td>
-                <td>5</td>
-                <td>45.2</td>
-                <td>25.7</td>
-                <td>N/A</td>
-                <td>0</td>
-                <td>N/A</td>
-                <td>N/A</td>
-            </tr>        </tbody>
+        <tbody>
+"@
+
+        foreach ($item in $Data) {
+            $memUsage = if ($null -ne $item.AvgMemoryUsagePercent) { $item.AvgMemoryUsagePercent } else { "N/A" }
+            $memPeakCount = if ($null -ne $item.MemoryPeakCount) { $item.MemoryPeakCount } else { "N/A" }
+            $memPeakDuration = if ($null -ne $item.MemoryAvgPeakDurationMinutes -and $item.MemoryAvgPeakDurationMinutes -gt 0) { $item.MemoryAvgPeakDurationMinutes } else { "N/A" }
+            $memPercentAbove = if ($null -ne $item.MemoryPercentageAboveThreshold) { $item.MemoryPercentageAboveThreshold } else { 0 }
+
+            # Déterminer la classe CSS en fonction du pourcentage de temps au-dessus du seuil
+            $rowClass = ""
+            $maxPercent = [math]::Max($item.CPUPercentageAboveThreshold, $memPercentAbove)
+            if ($maxPercent -ge 30) {
+                $rowClass = "warning-high"
+            } elseif ($maxPercent -ge 15) {
+                $rowClass = "warning-medium"
+            }
+
+            $html += @"
+            <tr class=`"$rowClass`">
+                <td>$($item.Subscription)</td>
+                <td>$($item.ResourceGroup)</td>
+                <td>$($item.VMName)</td>
+                <td>$($item.Location)</td>
+                <td>$($item.VMSize)</td>
+                <td>$($item.Cores)</td>
+                <td>$($item.MemoryGB)</td>
+                <td>$($item.AvgCPUPercent)</td>
+                <td>$($item.CPUPeakCount)</td>
+                <td>$($item.CPUAvgPeakDurationMinutes)</td>
+                <td>$($item.CPUPercentageAboveThreshold)</td>
+                <td>$memUsage</td>
+                <td>$memPeakCount</td>
+                <td>$memPeakDuration</td>
+                <td>$(if ($memPercentAbove -eq 0) { "N/A" } else { $memPercentAbove })</td>
+            </tr>
+"@
+        }
+
+        $html += @"
+        </tbody>
     </table>
 
     <div class="footer">
-        <p>Report generated on 2025-11-05 17:08:38</p>
-        <p>This is TEST DATA - Analysis period: 30 days | Thresholds: CPU < 20%, RAM < 30%</p>
+        <p>Report generated on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+        <p>Analysis period: $DaysToAnalyze days | Thresholds: CPU < $CPUOversizedThreshold%, RAM < $RAMOversizedThreshold%</p>
     </div>
 
     <script>
@@ -189,13 +710,13 @@
                 labels: ['0-10%', '10-20%', '20-30%', '30-50%', '50%+'],
                 datasets: [{
                     label: 'CPU Time Above 80%',
-                    data: [2, 0, 1, 0, 0],
+                    data: [$($cpuRanges["0-10%"]), $($cpuRanges["10-20%"]), $($cpuRanges["20-30%"]), $($cpuRanges["30-50%"]), $($cpuRanges["50%+"])],
                     backgroundColor: 'rgba(255, 99, 132, 0.7)',
                     borderColor: 'rgba(255, 99, 132, 1)',
                     borderWidth: 1
                 }, {
                     label: 'Memory Time Above 85%',
-                    data: [2, 1, 0, 0, 0],
+                    data: [$($memoryRanges["0-10%"]), $($memoryRanges["10-20%"]), $($memoryRanges["20-30%"]), $($memoryRanges["30-50%"]), $($memoryRanges["50%+"])],
                     backgroundColor: 'rgba(54, 162, 235, 0.7)',
                     borderColor: 'rgba(54, 162, 235, 1)',
                     borderWidth: 1
@@ -240,3 +761,75 @@
     </script>
 </body>
 </html>
+"@
+
+        $html | Out-File -FilePath $htmlPath -Encoding UTF8
+        Write-ColorOutput "HTML report generated: $htmlPath" "Success"
+    }
+    catch {
+        Write-ColorOutput "Error generating HTML: $_" "Error"
+    }
+}
+
+# =====================
+# SCRIPT PRINCIPAL
+# =====================
+
+Write-ColorOutput "`n========================================" "Info"
+Write-ColorOutput "  Azure VM Sizing Analysis Report" "Info"
+Write-ColorOutput "========================================`n" "Info"
+
+# Vérifier les modules
+if (-not (Test-AzModules)) {
+    Write-ColorOutput "`nScript interrompu: modules manquants." "Error"
+    exit 1
+}
+
+# Connexion à Azure
+if (-not (Connect-AzureAccount)) {
+    Write-ColorOutput "`nScript interrompu: échec de connexion à Azure." "Error"
+    exit 1
+}
+
+# Exécuter l'analyse
+Write-ColorOutput "`n--- Début de l'analyse ---`n" "Info"
+$results = Get-VMAnalysis
+
+# Afficher un résumé
+Write-ColorOutput "`n========================================" "Info"
+Write-ColorOutput "  Analysis Summary" "Info"
+Write-ColorOutput "========================================" "Info"
+Write-ColorOutput "Oversized VMs found: $($results.Count)" "Warning"
+if ($results.Count -gt 0) {
+    $avgCPUAll = [math]::Round(($results | Measure-Object -Property AvgCPUPercent -Average).Average, 2)
+    Write-ColorOutput "Average CPU usage: $avgCPUAll%" "Info"
+}
+
+# Exporter les résultats
+if ($results.Count -gt 0) {
+    Write-ColorOutput "`n--- Report Generation ---`n" "Info"
+    Write-ColorOutput "Output path: $OutputPath" "Info"
+
+    switch ($ExportFormat) {
+        "CSV" {
+            Export-ToCSV -Data $results -Path $OutputPath
+        }
+        "HTML" {
+            Export-ToHTML -Data $results -Path $OutputPath
+        }
+        "Both" {
+            Export-ToCSV -Data $results -Path $OutputPath
+            Export-ToHTML -Data $results -Path $OutputPath
+        }
+    }
+
+    Write-ColorOutput "`nReports generated successfully in: $(Split-Path -Parent $OutputPath)" "Success"
+}
+else {
+    Write-ColorOutput "`nNo oversized VMs found. All VMs are properly sized!" "Success"
+    Write-ColorOutput "No reports will be generated." "Info"
+}
+
+Write-ColorOutput "`n========================================" "Success"
+Write-ColorOutput "  Analysis completed successfully!" "Success"
+Write-ColorOutput "========================================`n" "Success"
