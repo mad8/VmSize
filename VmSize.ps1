@@ -136,53 +136,57 @@ function Get-VMCPUMetrics {
             -MetricName "Percentage CPU" `
             -StartTime $StartTime `
             -EndTime $EndTime `
-            -TimeGrain 01:00:00 `
+            -TimeGrain 00:05:00 `
             -AggregationType Average `
             -ErrorAction Stop
 
         if ($metrics.Data.Count -gt 0) {
             $avgCPU = ($metrics.Data | Measure-Object -Property Average -Average).Average
-            $maxCPU = ($metrics.Data | Measure-Object -Property Average -Maximum).Maximum
 
-            # Analyser les pics soutenus (CPU > seuil pendant plusieurs heures consécutives)
+            # Analyser les pics (CPU > seuil)
             $highCPUPeriods = @()
-            $currentPeriodStart = $null
             $currentPeriodDuration = 0
+            $totalPeakOccurrences = 0  # Nombre total de points au-dessus du seuil
 
             foreach ($dataPoint in $metrics.Data) {
                 if ($dataPoint.Average -ge $HighCPUThreshold) {
-                    if ($null -eq $currentPeriodStart) {
-                        $currentPeriodStart = $dataPoint.TimeStamp
-                    }
                     $currentPeriodDuration++
+                    $totalPeakOccurrences++
                 } else {
                     if ($currentPeriodDuration -gt 0) {
-                        $highCPUPeriods += $currentPeriodDuration
-                        $currentPeriodStart = $null
+                        # Convertir en minutes (chaque point = 5 minutes)
+                        $highCPUPeriods += $currentPeriodDuration * 5
                         $currentPeriodDuration = 0
                     }
                 }
             }
             # Ajouter la dernière période si elle existe
             if ($currentPeriodDuration -gt 0) {
-                $highCPUPeriods += $currentPeriodDuration
+                $highCPUPeriods += $currentPeriodDuration * 5
             }
 
-            # Calculer la durée moyenne des pics
-            $avgPeakDuration = if ($highCPUPeriods.Count -gt 0) {
+            # Calculer la durée moyenne des pics en minutes
+            $avgPeakDurationMinutes = if ($highCPUPeriods.Count -gt 0) {
                 [math]::Round(($highCPUPeriods | Measure-Object -Average).Average, 1)
             } else {
                 0
             }
 
-            # Nombre de pics
+            # Nombre de pics distincts
             $peakCount = $highCPUPeriods.Count
+
+            # Calculer le pourcentage de temps passé au-dessus du seuil
+            $percentageAboveThreshold = if ($metrics.Data.Count -gt 0) {
+                [math]::Round(($totalPeakOccurrences / $metrics.Data.Count) * 100, 1)
+            } else {
+                0
+            }
 
             return @{
                 Average = [math]::Round($avgCPU, 2)
-                Maximum = [math]::Round($maxCPU, 2)
                 PeakCount = $peakCount
-                AvgPeakDurationHours = $avgPeakDuration
+                AvgPeakDurationMinutes = $avgPeakDurationMinutes
+                PercentageAboveThreshold = $percentageAboveThreshold
             }
         }
     }
@@ -192,9 +196,9 @@ function Get-VMCPUMetrics {
 
     return @{
         Average = 0
-        Maximum = 0
         PeakCount = 0
-        AvgPeakDurationHours = 0
+        AvgPeakDurationMinutes = 0
+        PercentageAboveThreshold = 0
     }
 }
 
@@ -212,19 +216,13 @@ function Get-VMMemoryMetrics {
             -MetricName "Available Memory Bytes" `
             -StartTime $StartTime `
             -EndTime $EndTime `
-            -TimeGrain 01:00:00 `
+            -TimeGrain 00:05:00 `
             -AggregationType Average `
             -ErrorAction Stop
 
         if ($metrics.Data.Count -gt 0) {
             $avgAvailableMemoryBytes = ($metrics.Data | Measure-Object -Property Average -Average).Average
             $minAvailableMemoryBytes = ($metrics.Data | Measure-Object -Property Average -Minimum).Minimum
-
-            # Analyser les pics soutenus de mémoire (besoin de connaître la RAM totale pour calculer le %)
-            # On stocke les données brutes et on fera le calcul plus tard avec la RAM totale
-            $availableMemoryData = $metrics.Data | ForEach-Object {
-                [math]::Round($_.Average / 1GB, 2)
-            }
 
             return @{
                 AverageAvailableGB = [math]::Round($avgAvailableMemoryBytes / 1GB, 2)
@@ -261,12 +259,14 @@ function Get-MemoryPeakAnalysis {
     if ($null -eq $RawData -or $RawData.Count -eq 0 -or $TotalMemoryGB -le 0) {
         return @{
             PeakCount = 0
-            AvgPeakDurationHours = 0
+            AvgPeakDurationMinutes = 0
+            PercentageAboveThreshold = 0
         }
     }
 
     $highMemoryPeriods = @()
     $currentPeriodDuration = 0
+    $totalPeakOccurrences = 0  # Nombre total de points au-dessus du seuil
 
     foreach ($dataPoint in $RawData) {
         $availableGB = [math]::Round($dataPoint.Average / 1GB, 2)
@@ -274,28 +274,38 @@ function Get-MemoryPeakAnalysis {
 
         if ($usedPercent -ge $HighMemoryUsageThreshold) {
             $currentPeriodDuration++
+            $totalPeakOccurrences++
         } else {
             if ($currentPeriodDuration -gt 0) {
-                $highMemoryPeriods += $currentPeriodDuration
+                # Convertir en minutes (chaque point = 5 minutes)
+                $highMemoryPeriods += $currentPeriodDuration * 5
                 $currentPeriodDuration = 0
             }
         }
     }
     # Ajouter la dernière période si elle existe
     if ($currentPeriodDuration -gt 0) {
-        $highMemoryPeriods += $currentPeriodDuration
+        $highMemoryPeriods += $currentPeriodDuration * 5
     }
 
-    # Calculer la durée moyenne des pics
-    $avgPeakDuration = if ($highMemoryPeriods.Count -gt 0) {
+    # Calculer la durée moyenne des pics en minutes
+    $avgPeakDurationMinutes = if ($highMemoryPeriods.Count -gt 0) {
         [math]::Round(($highMemoryPeriods | Measure-Object -Average).Average, 1)
+    } else {
+        0
+    }
+
+    # Calculer le pourcentage de temps passé au-dessus du seuil
+    $percentageAboveThreshold = if ($RawData.Count -gt 0) {
+        [math]::Round(($totalPeakOccurrences / $RawData.Count) * 100, 1)
     } else {
         0
     }
 
     return @{
         PeakCount = $highMemoryPeriods.Count
-        AvgPeakDurationHours = $avgPeakDuration
+        AvgPeakDurationMinutes = $avgPeakDurationMinutes
+        PercentageAboveThreshold = $percentageAboveThreshold
     }
 }
 
@@ -438,12 +448,13 @@ function Get-VMAnalysis {
                     MemoryGB = $vmSize.MemoryGB
                     PowerState = $powerState
                     AvgCPUPercent = $cpuMetrics.Average
-                    MaxCPUPercent = $cpuMetrics.Maximum
                     CPUPeakCount = $cpuMetrics.PeakCount
-                    CPUAvgPeakDurationHours = $cpuMetrics.AvgPeakDurationHours
+                    CPUAvgPeakDurationMinutes = $cpuMetrics.AvgPeakDurationMinutes
+                    CPUPercentageAboveThreshold = $cpuMetrics.PercentageAboveThreshold
                     AvgMemoryUsagePercent = $memoryUsagePercent
                     MemoryPeakCount = $memoryPeakAnalysis.PeakCount
-                    MemoryAvgPeakDurationHours = $memoryPeakAnalysis.AvgPeakDurationHours
+                    MemoryAvgPeakDurationMinutes = $memoryPeakAnalysis.AvgPeakDurationMinutes
+                    MemoryPercentageAboveThreshold = $memoryPeakAnalysis.PercentageAboveThreshold
                     AvailableMemoryGB = $memMetrics.AverageAvailableGB
                     AnalysisPeriodDays = $DaysToAnalyze
                 }
@@ -604,12 +615,13 @@ function Export-ToHTML {
                 <th>vCores</th>
                 <th>Memory (GB)</th>
                 <th>Avg CPU (%)</th>
-                <th>Max CPU (%)</th>
                 <th>CPU Peaks</th>
-                <th>Avg Peak Duration (h)</th>
-                <th>Memory Usage (%)</th>
+                <th>Avg Peak Duration (min)</th>
+                <th>Time Above 80% (%)</th>
+                <th>Avg Memory Usage (%)</th>
                 <th>Memory Peaks</th>
-                <th>Avg Peak Duration (h)</th>
+                <th>Avg Peak Duration (min)</th>
+                <th>Time Above 85% (%)</th>
             </tr>
         </thead>
         <tbody>
@@ -618,7 +630,8 @@ function Export-ToHTML {
         foreach ($item in $Data) {
             $memUsage = if ($null -ne $item.AvgMemoryUsagePercent) { $item.AvgMemoryUsagePercent } else { "N/A" }
             $memPeakCount = if ($null -ne $item.MemoryPeakCount) { $item.MemoryPeakCount } else { "N/A" }
-            $memPeakDuration = if ($null -ne $item.MemoryAvgPeakDurationHours -and $item.MemoryAvgPeakDurationHours -gt 0) { $item.MemoryAvgPeakDurationHours } else { "N/A" }
+            $memPeakDuration = if ($null -ne $item.MemoryAvgPeakDurationMinutes -and $item.MemoryAvgPeakDurationMinutes -gt 0) { $item.MemoryAvgPeakDurationMinutes } else { "N/A" }
+            $memPercentAbove = if ($null -ne $item.MemoryPercentageAboveThreshold) { $item.MemoryPercentageAboveThreshold } else { "N/A" }
 
             $html += @"
             <tr>
@@ -630,12 +643,13 @@ function Export-ToHTML {
                 <td>$($item.Cores)</td>
                 <td>$($item.MemoryGB)</td>
                 <td>$($item.AvgCPUPercent)</td>
-                <td>$($item.MaxCPUPercent)</td>
                 <td>$($item.CPUPeakCount)</td>
-                <td>$($item.CPUAvgPeakDurationHours)</td>
+                <td>$($item.CPUAvgPeakDurationMinutes)</td>
+                <td>$($item.CPUPercentageAboveThreshold)</td>
                 <td>$memUsage</td>
                 <td>$memPeakCount</td>
                 <td>$memPeakDuration</td>
+                <td>$memPercentAbove</td>
             </tr>
 "@
         }
