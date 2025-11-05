@@ -201,34 +201,30 @@ function Get-VMMemoryMetrics {
     }
 }
 
-# Fonction pour obtenir les informations de sizing d'une VM
+# Fonction pour obtenir les informations de sizing d'une VM depuis Azure
 function Get-VMSizeInfo {
-    param([string]$VMSize)
+    param(
+        [string]$VMSize,
+        [string]$Location
+    )
 
     try {
-        # Ceci est une approximation - pour des données exactes, vous devrez interroger Get-AzVMSize
-        # avec le location de la VM
-        $sizeInfo = @{
-            "Standard_B1s" = @{Cores = 1; MemoryGB = 1}
-            "Standard_B2s" = @{Cores = 2; MemoryGB = 4}
-            "Standard_D2s_v3" = @{Cores = 2; MemoryGB = 8}
-            "Standard_D4s_v3" = @{Cores = 4; MemoryGB = 16}
-            "Standard_D8s_v3" = @{Cores = 8; MemoryGB = 32}
-            "Standard_D16s_v3" = @{Cores = 16; MemoryGB = 64}
-            "Standard_E2s_v3" = @{Cores = 2; MemoryGB = 16}
-            "Standard_E4s_v3" = @{Cores = 4; MemoryGB = 32}
-            "Standard_E8s_v3" = @{Cores = 8; MemoryGB = 64}
-            "Standard_F2s_v2" = @{Cores = 2; MemoryGB = 4}
-            "Standard_F4s_v2" = @{Cores = 4; MemoryGB = 8}
-        }
+        # Récupérer les informations réelles depuis Azure
+        $vmSizes = Get-AzVMSize -Location $Location -ErrorAction Stop
+        $sizeInfo = $vmSizes | Where-Object { $_.Name -eq $VMSize }
 
-        if ($sizeInfo.ContainsKey($VMSize)) {
-            return $sizeInfo[$VMSize]
+        if ($sizeInfo) {
+            return @{
+                Cores = $sizeInfo.NumberOfCores
+                MemoryGB = [math]::Round($sizeInfo.MemoryInMB / 1024, 0)
+            }
         }
     }
-    catch {}
+    catch {
+        Write-ColorOutput "Erreur lors de la récupération des infos de sizing pour $VMSize : $_" "Warning"
+    }
 
-    # Valeurs par défaut si le type n'est pas reconnu
+    # Valeurs par défaut si le type n'est pas trouvé
     return @{Cores = 0; MemoryGB = 0}
 }
 
@@ -298,8 +294,8 @@ function Get-VMAnalysis {
             $cpuMetrics = Get-VMCPUMetrics -ResourceId $vm.Id -StartTime $startTime -EndTime $endTime
             $memMetrics = Get-VMMemoryMetrics -ResourceId $vm.Id -StartTime $startTime -EndTime $endTime
 
-            # Obtenir les informations de sizing
-            $vmSize = Get-VMSizeInfo -VMSize $vm.HardwareProfile.VmSize
+            # Obtenir les informations de sizing réelles depuis Azure
+            $vmSize = Get-VMSizeInfo -VMSize $vm.HardwareProfile.VmSize -Location $vm.Location
 
             # Calculer l'utilisation mémoire en pourcentage
             $memoryUsagePercent = $null
@@ -382,6 +378,18 @@ function Export-ToHTML {
             [math]::Round(($Data | Measure-Object -Property AvgCPUPercent -Average).Average, 2)
         } else {
             0
+        }
+
+        # Calculer la moyenne de RAM usage (exclure les valeurs nulles)
+        $avgMemory = if ($Data.Count -gt 0) {
+            $memoryData = $Data | Where-Object { $null -ne $_.AvgMemoryUsagePercent }
+            if ($memoryData.Count -gt 0) {
+                [math]::Round(($memoryData | Measure-Object -Property AvgMemoryUsagePercent -Average).Average, 2)
+            } else {
+                "N/A"
+            }
+        } else {
+            "N/A"
         }
 
         $html = @"
@@ -472,6 +480,10 @@ function Export-ToHTML {
         <div class="stat-box">
             <div class="stat-number">$avgCPU%</div>
             <div class="stat-label">Average CPU Usage</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-number">$avgMemory$(if ($avgMemory -ne 'N/A') { '%' })</div>
+            <div class="stat-label">Average Memory Usage</div>
         </div>
     </div>
 
