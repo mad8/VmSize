@@ -410,16 +410,8 @@ function Get-VMAnalysis {
 
             # Analyser uniquement si on a des données de métriques (Average > 0 signifie qu'il y a eu de l'activité)
             if ($cpuMetrics.Average -gt 0 -or ($null -ne $memoryUsagePercent -and $memoryUsagePercent -gt 0)) {
-                # Vérifier si les pics sont soutenus (durée > 3 heures en moyenne = problème potentiel)
-                $hasSustainedCPUPeaks = $cpuMetrics.PeakCount -gt 0 -and $cpuMetrics.AvgPeakDurationHours -gt 3
-                $hasSustainedMemoryPeaks = $memoryPeakAnalysis.PeakCount -gt 0 -and $memoryPeakAnalysis.AvgPeakDurationHours -gt 3
-
-                # Si pics soutenus, la VM n'est PAS oversized (elle a besoin de ses ressources)
-                if ($hasSustainedCPUPeaks -or $hasSustainedMemoryPeaks) {
-                    $sizingStatus = "OK"
-                }
-                # Sinon, analyser normalement le CPU et RAM moyens
-                elseif ($cpuMetrics.Average -lt $CPUOversizedThreshold -and
+                # Analyser le CPU et RAM moyens pour déterminer si oversized
+                if ($cpuMetrics.Average -lt $CPUOversizedThreshold -and
                     ($null -eq $memoryUsagePercent -or $memoryUsagePercent -lt $RAMOversizedThreshold)) {
                     $sizingStatus = "OVERSIZED"
                 }
